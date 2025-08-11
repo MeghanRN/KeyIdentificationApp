@@ -1,293 +1,288 @@
-# Key Identification App
+# Key Identification App — Fused Outline Matcher
 
-Scan a key (camera or upload) and identify which **saved** key it matches. Create and manage a private database of your own keys. All data stays local.
+A dead-simple, reliable way to identify **your own keys** by comparing the **outline** of a new photo with keys you’ve saved before. No heavy ML. No cloud. Just OpenCV + NumPy + Streamlit — local and fast.
 
-This version uses a **single, unified identification pipeline** that’s robust to background, rotation, and small pose/scale changes—no need to take “the exact same photo” anymore.
+This build replaces the earlier, complex pipeline with a **lean fused-outline algorithm** that’s robust to rotation, small scale changes, and lighting differences.
 
 ---
 
-# Quick start
+## Features
 
-1. (Recommended) Create & activate a virtual environment
+* **One capture flow** (camera or upload) with a single control.
+* **Outline tracing**: Otsu threshold → largest contour → resample → PCA canonicalization.
+* **Tiny descriptors** (all 1-D, lightweight):
 
-   ```bash
-   python -m venv .venv
-   # Windows
-   .venv\Scripts\activate
-   # macOS/Linux
-   source .venv/bin/activate
+  * **Radial** signature (centroid → boundary distances).
+  * **Curvature** signature (turning angle along the outline).
+  * **Fourier magnitude** of the complex outline (shift-invariant).
+* **Chamfer distance** on rasterized outlines as a sanity check.
+* **Single fused score** (lower = better) with sensible defaults.
+* Local **SQLite** database; JSON export/import for portability.
+
+---
+
+## Quick Start
+
+```bash
+# 1) Create & activate a virtual environment (recommended)
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+# 2) Install dependencies
+pip install streamlit pillow numpy pandas opencv-python
+
+# 3) Run the app
+streamlit run app.py
+```
+
+> On servers/containers, you can use `opencv-python-headless` instead of `opencv-python`.
+
+---
+
+## How It Works (short version)
+
+1. **Segment** the key with Otsu thresholding and morphology; keep the **largest** contour.
+2. **Resample** the contour to a fixed length (default `256` points).
+3. **Canonicalize**: rotate to the principal axis (PCA) and scale to a standard height.
+4. **Describe** the outline with:
+
+   * `radial` — distance from centroid along the boundary (zero-mean, unit-norm).
+   * `curv` — smoothed turning angle between boundary points (zero-mean, unit-norm).
+   * `fourier` — first 32 low-frequency magnitude coefficients of the complex outline (normalized).
+5. **Compare** a query to every saved key using:
+
+   * Circular correlation for `radial` and `curv` (also checks mirrored order).
+   * L2 distance for `fourier`.
+   * **Chamfer** on rasterized outlines (256×256) as a tie-breaker.
+6. **Fuse** distances with weights:
+
+   ```
+   score = 0.45*radial + 0.25*curv + 0.20*fourier + 0.10*chamfer
    ```
 
-2. Install dependencies
-   (you can paste this to a `requirements.txt` or install directly)
-
-   ```bash
-   pip install streamlit pillow numpy pandas imagehash opencv-python scikit-image rembg
-   ```
-
-   * `rembg` is optional but strongly recommended for best background removal.
-   * If your platform needs it, you can use `opencv-python-headless` instead of `opencv-python`.
-
-3. Run the app
-
-   ```bash
-   streamlit run app.py
-   ```
+   **Lower is better.** Identical outlines approach 0.
 
 ---
 
-# What’s new (tech highlights)
+## Using the App
 
-* **Unified pipeline** for every image:
+### Add keys (build your database)
 
-  * **Background removal** using **U²-Net** via `rembg` (falls back to robust OpenCV thresholding if `rembg` isn’t available).
-  * **Canonicalization**: auto-rotates the silhouette with PCA so the blade is horizontal, flips so the blade points right, and normalizes scale.
-  * **Descriptors (features) per key**:
+1. Go to **“➕ Add Key”**.
+2. Capture/upload a clear photo of **one key** on a plain background.
+3. Enter **Name** and **Purpose**, then **Add key**.
+4. The app saves the image and stores the **outline descriptor**.
 
-    * **Elliptic Fourier Descriptors (EFD)** of the closed contour (rotation/scale invariant global shape).
-    * **Hu** + **Zernike** moments on the normalized mask (global shape invariants).
-    * **Bitting profile**: a 1-D curve of tooth depth along the blade, matched with **DTW** (Dynamic Time Warping).
-    * **Edge/contour distance**: **Hausdorff** (or Chamfer fallback) between silhouettes.
-    * **Local features**: **ORB** descriptors on edges as a tie-breaker.
-  * **Two-stage retrieval**:
+### Identify a key
 
-    1. Coarse shortlist with global shape (EFD + Hu + Zernike).
-    2. Re-rank with Hausdorff/Chamfer + DTW (bitting) + ORB inlier ratio.
-  * **Score fusion**: components are combined with tuned weights into one final score (lower is better).
-* **Database schema** extended to store **Zernike**, **bitting**, and **ORB** so you get the **full fused score immediately** for past and new keys.
-* **One capture flow** (camera or upload) — no more parallel code paths.
+1. Go to **“📷 Scan & Identify”**.
+2. Capture/upload a new photo of a key.
+3. The app shows:
 
----
+   * The detected mask + resampled outline (debug image).
+   * The **best match** with its fused distance.
+   * Top candidates and a breakdown of component distances.
 
-# How it works
+### Manage / Export / Import
 
-1. **Segmentation**
-   We remove the background with U²-Net (`rembg`) if available; otherwise, an OpenCV fallback:
+* **“🗂️ My Keys”** lists your keys; expand *Outline descriptors* to see stored signals.
+* **Export** keys (CSV) and shapes (JSON).
+* **Import** keys (CSV/JSON) and shapes (JSON).
 
-   * Gray → CLAHE → adaptive threshold → morphology → keep largest component.
-
-2. **Canonicalization**
-
-   * PCA finds the major axis → rotate to horizontal.
-   * Flip if needed so the blade faces right.
-   * Normalize to a standard height (scale invariance).
-
-3. **Feature extraction**
-
-   * **EFD**: 24 harmonics (configurable) → rotation/scale/translation invariant contour signature.
-   * **Hu moments** (on binary mask, log-scaled).
-   * **Zernike moments** (requires `scikit-image`) — optional, but we store when available.
-   * **Bitting profile**: sample tooth depth along the blade (right \~60% of mask) into a normalized 1-D vector.
-   * **ORB**: detect/describe edge keypoints for local similarity.
-
-4. **Matching & score**
-
-   * Compute distances:
-
-     * `efd`: L2(EFD vectors)
-     * `hu`: L2(Hu vectors)
-     * `zern`: L2(Zernike vectors) if both keys have it
-     * `haus`: Hausdorff (or Chamfer-like fallback) between silhouettes
-     * `dtw`: DTW distance between bitting curves
-     * `orb`: 1 − inlier\_ratio (Lowe ratio test on ORB matches)
-   * Fuse with weights (defaults):
-
-     ```
-     0.30*efd + 0.12*hu + 0.08*zern + 0.30*haus + 0.15*dtw + 0.05*orb
-     ```
-   * Lower is better. You can tune the **accept threshold** in the sidebar.
-
-5. **Auxiliary view (legacy)**
-   We still compute perceptual hashes (a/p/d/w) as a secondary/diagnostic view; the **primary verdict** is the fused shape score.
+  * When importing keys, if `image_path` exists, the app computes & stores outline descriptors automatically.
 
 ---
 
-# Project structure
+## Thresholds & Tuning
+
+* Sidebar default **accept threshold** = **0.85**.
+
+  * Typical matches land between **0.5–1.2**, depending on photos.
+  * Lower = stricter (fewer false positives, more false negatives).
+* **Top K** controls how many candidates to display.
+
+If your images are very consistent, try **0.6–0.9**. If they vary a lot, you may prefer **1.0–1.4**.
+
+---
+
+## Image Tips (matters a lot)
+
+* Use a **plain, contrasting background** (white paper works great).
+* Keep the **entire key** in frame; avoid hands/fingers overlapping the outline.
+* Diffuse lighting (avoid harsh glare).
+* Orientation doesn’t need to be perfect — the app auto-aligns.
+
+---
+
+## Project Structure
 
 ```
 .
-├── app.py                # Streamlit app (UI + DB)
-├── cv_key.py             # CV pipeline: segmentation, features, scoring
-├── data/
-│   ├── images/           # saved key images
-│   ├── exports/          # CSV/JSON exports
-│   └── keys.db           # SQLite database
-└── requirements.txt      # dependencies (optional)
+├── app.py        # Streamlit UI + SQLite wiring + import/export
+├── cv_key.py     # Outline extraction, descriptors, and fused distance
+└── data/
+    ├── images/   # Saved images
+    ├── exports/  # CSV/JSON exports
+    └── keys.db   # SQLite database
 ```
 
 ---
 
-# Database
+## Database Schema
 
-We use SQLite (`data/keys.db`) with two tables:
+### `keys`
 
-## `keys`
+| column      | type | notes                       |
+| ----------- | ---- | --------------------------- |
+| id (PK)     | int  | autoincrement               |
+| name        | text | user-provided               |
+| purpose     | text | user-provided               |
+| description | text | optional                    |
+| tags        | text | optional                    |
+| image\_path | text | path to saved JPEG          |
+| created\_at | text | default `CURRENT_TIMESTAMP` |
 
-| column                  | type | note                        |
-| ----------------------- | ---- | --------------------------- |
-| id (PK)                 | int  | autoincrement               |
-| name                    | text | user-provided               |
-| purpose                 | text | user-provided               |
-| description             | text | optional                    |
-| tags                    | text | optional                    |
-| image\_path             | text | local path to saved JPEG    |
-| ahash/phash/dhash/whash | text | perceptual hash hex strings |
-| created\_at             | text | default `CURRENT_TIMESTAMP` |
+### `key_shapes`
 
-## `key_shapes`
+| column    | type | notes                                                        |
+| --------- | ---- | ------------------------------------------------------------ |
+| key\_id   | int  | 1:1 with `keys.id`                                           |
+| signature | text | JSON dict: `{"radial":[...], "curv":[...], "fourier":[...]}` |
+| contour   | text | JSON list of `[x, y]` points (canonicalized)                 |
+| width     | int  | original mask width                                          |
+| height    | int  | original mask height                                         |
+| svg       | text | reserved; not used in this build                             |
 
-| column       | type | note                                                    |
-| ------------ | ---- | ------------------------------------------------------- |
-| key\_id PK   | int  | 1:1 with `keys.id`                                      |
-| svg          | text | optional (silhouette rendering)                         |
-| hu           | text | JSON list\[float]                                       |
-| fourier      | text | JSON list\[float] (EFD vector)                          |
-| contour      | text | JSON list\[\[x,y], ...] (canonicalized)                 |
-| width/height | int  | canonical mask size                                     |
-| zernike      | text | JSON list\[float] (optional; requires `scikit-image`)   |
-| bitting      | text | JSON list\[float] 1-D depth curve                       |
-| orb\_kp      | int  | number of ORB keypoints                                 |
-| orb\_desc    | text | JSON list of ORB descriptors (uint8 rows); can be large |
-
-> On upgrade, the app will **migrate** the `key_shapes` table to add missing columns.
+> **Legacy import**: if a prior export has `signature` as a **list**, it’s treated as `{"radial": list}` automatically.
 
 ---
 
-# Usage
+## Import/Export Formats
 
-## 1) Add a key
+### Exported SHAPES JSON (example)
 
-* Go to **“➕ Add Key”**.
-* Capture or upload a photo (one unified control).
-* Fill in **Name** and **Purpose** (required).
-* Submit to save:
+```json
+[
+  {
+    "id": 12,
+    "name": "Black house key",
+    "purpose": "Front door",
+    "image_path": "data/images/20250811_143210_black.jpg",
+    "signature": {
+      "radial": [ ... 256 floats ... ],
+      "curv":   [ ... 256 floats ... ],
+      "fourier":[ ... 32 floats  ... ]
+    },
+    "contour": [[x, y], [x, y], ...],
+    "width": 1280,
+    "height": 720,
+    "svg": null
+  }
+]
+```
 
-  * The original image is saved in `data/images/`.
-  * The app computes and stores **all** shape features (EFD, Hu, Zernike, bitting, ORB).
+### Imported KEYS CSV
 
-## 2) Identify a key
-
-* Go to **“📷 Scan & Identify”**.
-* Capture or upload a photo of a **single** key on a plain background.
-* The app shows:
-
-  * Canonicalized silhouette preview.
-  * **Best match** and **score** (lower is better).
-  * **Top candidates** and a **breakdown** of component distances for the best candidate.
-  * (Optional) Perceptual-hash comparison as a secondary view.
-
-## 3) Manage your keys
-
-* **“🗂️ My Keys”** shows your saved keys.
-* Expand **Shape features** to see stored descriptors; bitting curve is plotted if available.
-* Delete a key from this screen (removes the image and DB row).
-
-## 4) Export / Import
-
-* Export **KEYS** to CSV/JSON and **SHAPES** to JSON.
-* Import **KEYS** CSV/JSON (recomputes shape features for any rows that have accessible images).
-* Import **SHAPES** JSON to backfill features (requires corresponding key rows to exist).
-* **Maintenance**: “Compute/refresh ALL” recomputes *full* shape features for every key in the DB.
+Must include at least: `name`, `purpose`, `image_path`.
+If `image_path` exists locally, the app computes the outline descriptors on import.
 
 ---
 
-# Image capture tips
+## Troubleshooting
 
-* Use a **plain, contrasting background** (paper, desk mat).
-* Keep the **blade roughly horizontal**. The app auto-rotates and flips, but good framing helps.
-* Avoid heavy glare; diffuse light is best.
-* Keep the entire key in frame; crop out any second object.
+* **“No key outline found”**
+  The background is too busy or the key is partly out of frame. Use plain paper and include the full key.
 
----
+* **Wrong matches**
 
-# Settings & thresholds
+  * Lower the accept threshold (stricter).
+  * Add 2–3 representative photos per key (different lighting/backgrounds).
+  * Ensure keys are not overlapping other objects.
 
-In the sidebar:
-
-* **Fused shape accept threshold** (default `0.85`):
-  Lower is stricter. Typical good range is **0.6–1.2** depending on your photos.
-
-* **Top K (shape)**: how many candidates to show.
-
-* **Aux hash threshold** (default `35`) & **Top K (hash)**: diagnostic/secondary view.
-
-> Tuning tip: Add 5–10 keys first, test a few scans, then adjust the fused threshold until true matches land **below** it and non-matches stay **above** it.
-
----
-
-# Troubleshooting
-
-* **“ImportError: cannot import name `extract_and_describe` from `cv_key`”**
-  Ensure you copied the **new** `cv_key.py` (the one that defines `extract_and_describe`).
-  If you can’t update immediately, there’s a compatibility shim you can drop into `app.py` to wrap the old `extract_shape_features`.
-
-* **`rembg` not installed or fails**
-  The app automatically falls back to an OpenCV thresholding pipeline. For best results, `pip install rembg`.
-
-* **OpenCV conflicting builds**
-  Some environments prefer `opencv-python-headless`. Uninstall `opencv-python` and install `opencv-python-headless`.
-
-* **Zernike not computed**
-  Requires `scikit-image`. Install it and recompute features from **Export/Import → “Compute/refresh ALL”**.
-
-* **Score seems too high/low**
-  Adjust the **fused threshold** in the sidebar. Make sure training photos are clean, single-key, and reasonably close.
-
-* **Switching cameras**
-  `st.camera_input` uses the **browser’s** selected camera. Change it in your browser’s site settings (Chrome: `chrome://settings/content/camera`, Safari: Settings → Websites → Camera, etc.), then reload.
-
----
-
-# Privacy & data
-
-* Everything is local to the `data/` folder:
-
-  * DB at `data/keys.db`
-  * Images under `data/images/`
-  * Exports under `data/exports/`
-* Keep this folder private. The app is for **personal** record-keeping only.
-
----
-
-# Development & tests
-
-* Minimal self-tests exist and can be run with:
+* **OpenCV build errors on servers**
+  Try:
 
   ```bash
-  # Windows
-  set RUN_KEY_APP_TESTS=1 && streamlit run app.py
-  # macOS/Linux
-  RUN_KEY_APP_TESTS=1 streamlit run app.py
+  pip uninstall opencv-python
+  pip install opencv-python-headless
   ```
 
-  They check basic hashing and a shape smoke test.
+* **Switching cameras**
+  `st.camera_input` uses your **browser’s** selected camera. Change it in site permissions (e.g., Chrome: Settings → Privacy & Security → Site Settings → Camera), then reload.
 
-* Recommended Python versions: 3.9–3.11 (works on newer too, but CV stacks vary by platform).
-
----
-
-# Roadmap (optional ideas)
-
-* **Small learned re-ranker** (Siamese / triplet) on your private dataset for even tighter ranking.
-* **SVG export** of canonical silhouette (currently stored as contour; can render on demand).
-* **Mobile PWA wrapper** for a more camera-native feel.
+* **Module changes not showing**
+  Stop the app (Ctrl+C) and run `streamlit run app.py` again to clear caches.
 
 ---
 
-# FAQ
+## Advanced (optional)
 
-**Q: Can it identify the brand/lock model or decode bitting numbers?**
-A: No. It performs **visual similarity matching** against *your* saved keys. It doesn’t decode keyways/bitting specs.
+Edit constants in `cv_key.py`:
 
-**Q: Do I have to use `rembg`?**
-A: No, but you’ll get more robust segmentation with it.
+```python
+SIG_LEN   = 256   # samples along outline (try 512 for tighter matching)
+FOURIER_K = 32    # low-frequency magnitude count (16..48 is typical)
+CANVAS    = 256   # raster size for chamfer distance
+```
 
-**Q: Can I store thousands of keys?**
-A: Technically yes; precomputing and caching features is designed for that. For very large sets, consider periodic exports and SSD storage.
+Change fusion weights inside `fused_outline_distance`:
+
+```python
+w_rad, w_curv, w_four, w_ch = 0.45, 0.25, 0.20, 0.10
+```
+
+> Heavier `radial` emphasizes global silhouette; heavier `curv` emphasizes tooth edges/shoulders.
 
 ---
 
-# License & acknowledgments
+## Self-Test
 
-* Built with **Streamlit**, **OpenCV**, **scikit-image**, **rembg (U²-Net)**, and **Pillow**.
-* You own your data; keep it private and comply with local laws.
+You can run a quick smoke test:
+
+```bash
+# Windows
+set RUN_KEY_APP_TESTS=1 && streamlit run app.py
+# macOS/Linux
+RUN_KEY_APP_TESTS=1 streamlit run app.py
+```
+
+The test creates two similar rectangles and ensures the fused distance is small.
+
+---
+
+## Privacy
+
+All data lives under `./data/` on your machine:
+
+* DB: `data/keys.db`
+* Images: `data/images/`
+* Exports: `data/exports/`
+
+No images or descriptors are uploaded anywhere.
+
+---
+
+## Limitations & Notes
+
+* This identifies keys **by visual outline** against **your** saved set.
+  It does **not** decode bitting depths, keyway types, or manufacturer models.
+* Very similar blanks may require tighter photos and a slightly lower threshold.
+* Mirroring is handled automatically (we check both directions).
+
+---
+
+## Roadmap (nice-to-haves)
+
+* In-app **outline overlay** guide for consistent framing.
+* Batch re-compute button for shapes (maintenance).
+* Optional **mobile PWA** wrapper for a more camera-native feel.
+
+---
+
+## License
+
+You own your data. Use responsibly and comply with local laws.
+Built with Streamlit, NumPy, OpenCV, Pillow, and SQLite.

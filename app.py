@@ -1,21 +1,18 @@
 """
-Key Identification App — Simple Outline Matcher
-===============================================
-- One algorithm: TRACE OUTLINE → RESAMPLE → RADIAL SIGNATURE
-- One score: minimal circular distance (with mirror) between signatures
-  * 0.00 = identical outline
-  * ~0.2–0.8 = similar
-  * >1.5 = different
+Key Identification App — Fused Outline Matcher
+==============================================
+- Outline only: Otsu → largest contour → PCA-canonicalize → resample
+- Descriptors: radial, curvature, fourier-magnitude
+- Plus chamfer on rasterized outline
+- One fused score (lower is better). Tunable threshold.
 
-Quick start
------------
-1) python -m venv .venv
-   # Windows: .venv\\Scripts\\activate
-   # macOS/Linux: source .venv/bin/activate
-
-2) pip install streamlit pillow numpy pandas opencv-python
-
-3) streamlit run app.py
+Setup
+-----
+python -m venv .venv
+# Windows: .venv\\Scripts\\activate
+# macOS/Linux: source .venv/bin/activate
+pip install streamlit pillow numpy pandas opencv-python
+streamlit run app.py
 """
 
 from __future__ import annotations
@@ -34,30 +31,26 @@ from PIL import Image, ImageOps
 import streamlit as st
 
 from cv_key import (
-    extract_outline_signature,
+    extract_outline_features,
     OutlineFeatures,
-    outline_distance,
+    fused_outline_distance,
     SIG_LEN,
 )
 
-# ---------------------------
-# Paths & constants
-# ---------------------------
-APP_TITLE = "Key Identifier (Simple Outline)"
+# ---------- constants / paths ----------
+APP_TITLE = "Key Identifier (Fused Outline)"
 DATA_DIR = Path("data")
 IMG_DIR = DATA_DIR / "images"
 EXPORT_DIR = DATA_DIR / "exports"
 DB_PATH = DATA_DIR / "keys.db"
 
 DEFAULT_TOPK = 5
-DEFAULT_ACCEPT_THRESHOLD = 0.75  # lower = more similar
+DEFAULT_ACCEPT_THRESHOLD = 0.85  # lower = more similar
 
 for p in [DATA_DIR, IMG_DIR, EXPORT_DIR]:
     p.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------
-# DB schema (minimal)
-# ---------------------------
+# ---------- DB ----------
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS keys (
     id INTEGER PRIMARY KEY,
@@ -73,11 +66,11 @@ CREATE TABLE IF NOT EXISTS keys (
 SCHEMA_SQL_SHAPES = """
 CREATE TABLE IF NOT EXISTS key_shapes (
     key_id INTEGER PRIMARY KEY,
-    signature TEXT,   -- JSON list[float], length == SIG_LEN
-    contour TEXT,     -- JSON list[[x,y],...], length == SIG_LEN
+    signature TEXT,   -- JSON (dict) {"radial":[...], "curv":[...], "fourier":[...]} OR legacy list
+    contour TEXT,     -- JSON list[[x,y],...], canonical
     width INTEGER,
     height INTEGER,
-    svg TEXT,         -- (optional, not used; reserved for future)
+    svg TEXT,
     FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
 );
 """
@@ -87,20 +80,13 @@ def _migrate_shapes_table() -> None:
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(key_shapes)")
         cols = {r[1] for r in cur.fetchall()}
-        # Ensure required columns exist; add if missing
-        to_add = []
-        if "signature" not in cols:
-            to_add.append("ALTER TABLE key_shapes ADD COLUMN signature TEXT;")
-        if "contour" not in cols:
-            to_add.append("ALTER TABLE key_shapes ADD COLUMN contour TEXT;")
-        if "width" not in cols:
-            to_add.append("ALTER TABLE key_shapes ADD COLUMN width INTEGER;")
-        if "height" not in cols:
-            to_add.append("ALTER TABLE key_shapes ADD COLUMN height INTEGER;")
-        if "svg" not in cols:
-            to_add.append("ALTER TABLE key_shapes ADD COLUMN svg TEXT;")
-        for stmt in to_add:
-            cur.execute(stmt)
+        adds = []
+        if "signature" not in cols: adds.append("ALTER TABLE key_shapes ADD COLUMN signature TEXT;")
+        if "contour" not in cols:   adds.append("ALTER TABLE key_shapes ADD COLUMN contour TEXT;")
+        if "width" not in cols:     adds.append("ALTER TABLE key_shapes ADD COLUMN width INTEGER;")
+        if "height" not in cols:    adds.append("ALTER TABLE key_shapes ADD COLUMN height INTEGER;")
+        if "svg" not in cols:       adds.append("ALTER TABLE key_shapes ADD COLUMN svg TEXT;")
+        for s in adds: cur.execute(s)
         conn.commit()
 
 @dataclass
@@ -113,9 +99,6 @@ class KeyRecord:
     image_path: str
     created_at: str
 
-# ---------------------------
-# DB helpers
-# ---------------------------
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -138,8 +121,10 @@ def insert_key(name: str, purpose: str, description: str, tags: str, image_path:
         return cur.lastrowid
 
 def insert_shape(key_id: int, feats: OutlineFeatures, svg: Optional[str] = None) -> None:
+    sig = feats.signature
+    # Backward-compatible: ensure dict in JSON
     payload = {
-        "signature": json.dumps(feats.signature),
+        "signature": json.dumps(sig),
         "contour": json.dumps(feats.contour),
         "width": int(feats.width),
         "height": int(feats.height),
@@ -147,12 +132,9 @@ def insert_shape(key_id: int, feats: OutlineFeatures, svg: Optional[str] = None)
     }
     with get_conn() as conn:
         conn.execute(
-            """
-            INSERT OR REPLACE INTO key_shapes (key_id, signature, contour, width, height, svg)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (key_id, payload["signature"], payload["contour"], payload["width"],
-             payload["height"], payload["svg"]),
+            """INSERT OR REPLACE INTO key_shapes (key_id, signature, contour, width, height, svg)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (key_id, payload["signature"], payload["contour"], payload["width"], payload["height"], payload["svg"]),
         )
         conn.commit()
 
@@ -185,15 +167,22 @@ def fetch_shapes() -> List[Dict[str, object]]:
         rows = cur.fetchall()
     out = []
     for (kid, name, purpose, image_path, signature, contour, w, h, svg) in rows:
+        sig = None
+        try:
+            sig = json.loads(signature) if signature else None
+            # migrate legacy list -> dict
+            if isinstance(sig, list):
+                sig = {"radial": sig}
+        except Exception:
+            sig = None
         out.append({
             "id": kid,
             "name": name,
             "purpose": purpose,
             "image_path": image_path,
-            "signature": json.loads(signature) if signature else None,
+            "signature": sig,
             "contour": json.loads(contour) if contour else None,
-            "width": int(w),
-            "height": int(h),
+            "width": int(w), "height": int(h),
             "svg": svg,
         })
     return out
@@ -204,16 +193,12 @@ def delete_key(key_id: int) -> None:
         cur.execute("SELECT image_path FROM keys WHERE id=?", (key_id,))
         row = cur.fetchone()
         if row and row[0]:
-            try:
-                Path(row[0]).unlink(missing_ok=True)
-            except Exception:
-                pass
+            try: Path(row[0]).unlink(missing_ok=True)
+            except Exception: pass
         cur.execute("DELETE FROM keys WHERE id=?", (key_id,))
         conn.commit()
 
-# ---------------------------
-# Image helpers
-# ---------------------------
+# ---------- image helpers ----------
 def _open_image(file_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     return ImageOps.exif_transpose(img)
@@ -226,23 +211,15 @@ def _save_image(img: Image.Image, suggested_name: str) -> str:
     img.save(out_path, format="JPEG", quality=92)
     return str(out_path)
 
-# ---------------------------
-# UI helpers
-# ---------------------------
+# ---------- UI helpers ----------
 def capture_image_simple(key: str) -> Optional[Image.Image]:
     st.markdown("#### Capture or upload a key photo")
     cam = st.camera_input("Take a photo", key=f"cam_{key}")
     upl = st.file_uploader("…or upload a photo", type=["jpg", "jpeg", "png"], key=f"upl_{key}")
 
-    img = None
-    if cam is not None:
-        img = _open_image(cam.getvalue())
-    elif upl is not None:
-        img = _open_image(upl.getvalue())
-
+    img = _open_image(cam.getvalue()) if cam is not None else (_open_image(upl.getvalue()) if upl is not None else None)
     if img is not None:
         st.image(img, caption="Preview", width=420)
-
     return img
 
 def key_card(rec: KeyRecord, shape_row: Optional[Dict[str, object]] = None):
@@ -255,43 +232,51 @@ def key_card(rec: KeyRecord, shape_row: Optional[Dict[str, object]] = None):
     with cols[1]:
         st.markdown(f"**{rec.name}**")
         st.caption(f"Purpose: {rec.purpose}")
-        if rec.description:
-            st.write(rec.description)
-        if rec.tags:
-            st.write(f"Tags: `{rec.tags}`")
+        if rec.description: st.write(rec.description)
+        if rec.tags: st.write(f"Tags: `{rec.tags}`")
         st.caption(f"Added: {rec.created_at}")
 
-        with st.expander("Outline signature"):
-            if shape_row and shape_row.get("signature"):
-                st.write(f"Length: {len(shape_row['signature'])} samples")
-                try:
-                    st.line_chart(pd.Series(shape_row["signature"]), height=120)
-                except Exception:
-                    st.write("(plot unavailable)")
-            else:
+        with st.expander("Outline descriptors"):
+            if not shape_row or not shape_row.get("signature"):
                 st.info("No outline data stored yet.")
+            else:
+                sig = shape_row["signature"]
+                if isinstance(sig, dict):
+                    if sig.get("radial"):
+                        st.write(f"radial: {len(sig['radial'])} samples")
+                        try: st.line_chart(pd.Series(sig["radial"]), height=120)
+                        except Exception: pass
+                    if sig.get("curv"):
+                        st.write(f"curvature: {len(sig['curv'])} samples")
+                        try: st.line_chart(pd.Series(sig["curv"]), height=120)
+                        except Exception: pass
+                    if sig.get("fourier"):
+                        st.write(f"fourier: {len(sig['fourier'])} coeffs")
+                else:
+                    # legacy
+                    st.write(f"signature: {len(sig)} samples")
+                    try: st.line_chart(pd.Series(sig), height=120)
+                    except Exception: pass
 
         del_col, _ = st.columns([1, 4])
         with del_col:
             if st.button("Delete", type="secondary", key=f"del_{rec.id}"):
                 delete_key(rec.id)
                 st.success(f"Deleted key #{rec.id}")
-                st.rerun()
+                st.experimental_rerun()
 
-# ---------------------------
-# App
-# ---------------------------
+# ---------- app ----------
 init_db()
 st.set_page_config(page_title=APP_TITLE, page_icon="🔑", layout="wide")
 st.title(APP_TITLE)
-st.caption("Simple outline-based matching. Lower score = closer outline.")
+st.caption("Fused outline matching (radial + curvature + fourier + chamfer). Lower score = closer outline.")
 
 with st.sidebar:
     st.header("Settings")
     thresh = st.slider(
-        "Accept if outline distance ≤",
+        "Accept if fused distance ≤",
         min_value=0.10, max_value=2.50, value=DEFAULT_ACCEPT_THRESHOLD, step=0.01,
-        help="0.0 = identical. 0.4–0.9 often indicates a match depending on your photos."
+        help="0.0 ≈ identical. 0.5–1.2 is a typical match band depending on photos."
     )
     topk = st.slider("Top K candidates", 1, 20, DEFAULT_TOPK)
     st.divider()
@@ -307,7 +292,7 @@ with tabs[0]:
 
     if target_img is not None:
         try:
-            q_feats, dbg = extract_outline_signature(target_img)
+            q_feats, dbg = extract_outline_features(target_img)
             st.image(dbg, caption="Detected mask & resampled outline", width=420)
         except Exception as e:
             st.error(f"Failed to extract outline: {e}")
@@ -320,23 +305,30 @@ with tabs[0]:
             scored = []
             for rec in shape_rows:
                 try:
+                    sig = rec.get("signature")
+                    if not sig: continue
+                    # migrate legacy single list -> dict
+                    if isinstance(sig, list):
+                        sig = {"radial": sig}
                     cand = OutlineFeatures(
                         width=rec["width"], height=rec["height"],
                         contour=rec["contour"],
-                        signature=rec["signature"],
+                        signature=sig,
                     )
-                    d = outline_distance(q_feats, cand)
-                    scored.append((rec, d))
+                    d, comps = fused_outline_distance(q_feats, cand)
+                    scored.append((rec, d, comps))
                 except Exception:
                     continue
             scored.sort(key=lambda x: x[1])
 
             if scored:
-                best_rec, best_d = scored[0]
+                best_rec, best_d, comps = scored[0]
                 verdict = "✅ Likely match" if best_d <= thresh else "⚠️ Uncertain match"
                 st.markdown(f"### {verdict}: **{best_rec['name']}** — distance **{best_d:.3f}**")
+                with st.expander("Distance breakdown (best)"):
+                    st.write({k: round(v, 4) for k, v in comps.items()})
                 with st.expander("Top candidates"):
-                    for rec, d in scored[:topk]:
+                    for rec, d, _ in scored[:topk]:
                         st.write(f"- #{rec['id']} — **{rec['name']}** (purpose: {rec['purpose']}) — dist **{d:.3f}**")
 
         st.divider()
@@ -351,7 +343,7 @@ with tabs[0]:
                 path = _save_image(target_img, suggested_name=name or "scan")
                 new_id = insert_key(name, purpose or "(unspecified)", description, tags, path)
                 try:
-                    feats, _ = extract_outline_signature(Image.open(path).convert("RGB"))
+                    feats, _ = extract_outline_features(Image.open(path).convert("RGB"))
                     insert_shape(new_id, feats, svg=None)
                     st.success(f"Saved key #{new_id} with outline data.")
                 except Exception as e:
@@ -378,7 +370,7 @@ with tabs[1]:
                 path = _save_image(add_img, suggested_name=name)
                 new_id = insert_key(name, purpose, description, tags, path)
                 try:
-                    feats, _ = extract_outline_signature(Image.open(path).convert("RGB"))
+                    feats, _ = extract_outline_features(Image.open(path).convert("RGB"))
                     insert_shape(new_id, feats, svg=None)
                     st.success(f"Added key #{new_id} with outline data.")
                 except Exception as e:
@@ -431,10 +423,15 @@ with tabs[3]:
             st.success(f"Exported KEYS to {out}")
         if st.button("Export SHAPES to JSON"):
             rows = fetch_shapes()
+            # ensure JSON-serializable
+            serial = []
+            for r in rows:
+                s = dict(r)
+                serial.append(s)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out = EXPORT_DIR / f"key_shapes_{ts}.json"
             with open(out, "w", encoding="utf-8") as f:
-                json.dump(rows, f, indent=2)
+                json.dump(serial, f, indent=2)
             st.success(f"Exported SHAPES to {out}")
 
     with c2:
@@ -462,11 +459,10 @@ with tabs[3]:
                                 str(row.get("tags", "")),
                                 str(row.get("image_path", "")).strip(),
                             )
-                            # if image exists, compute outline
                             p = str(row.get("image_path", "")).strip()
                             if p and Path(p).exists():
                                 try:
-                                    feats, _ = extract_outline_signature(Image.open(p).convert("RGB"))
+                                    feats, _ = extract_outline_features(Image.open(p).convert("RGB"))
                                     insert_shape(new_id, feats, svg=None)
                                 except Exception:
                                     pass
@@ -488,8 +484,7 @@ with tabs[3]:
                             key_id = int(r["id"])
                             cur = conn.cursor()
                             cur.execute("SELECT 1 FROM keys WHERE id=?", (key_id,))
-                            if not cur.fetchone():
-                                continue
+                            if not cur.fetchone(): continue
                             conn.execute(
                                 """
                                 INSERT OR REPLACE INTO key_shapes
@@ -506,32 +501,28 @@ with tabs[3]:
                                 ),
                             )
                             count += 1
-                        except Exception:
-                            continue
+                        except Exception as e:
+                            st.warning(f"Skipped a row: {e}")
                     conn.commit()
                 st.success(f"Imported/updated {count} SHAPES rows.")
             except Exception as e:
                 st.error(f"Import SHAPES failed: {e}")
 
 st.divider()
-st.caption("Tip: plain background, entire key in frame. The outline is all that matters.")
+st.caption("Tips: plain background, full key in frame. Rotation doesn’t need to be perfect.")
 
-# ---------------------------
-# Self-test (optional)
-# ---------------------------
+# ---------- (optional) self-test ----------
 def _run_self_tests():
-    # Simple smoke: two similar rectangles
-    base = Image.new("L", (300, 160), 0)
-    rect = Image.new("L", (160, 60), 255)
-    base.paste(rect, (70, 50))
+    base = Image.new("L", (320, 160), 0)
+    rect = Image.new("L", (170, 60), 255)
+    base.paste(rect, (75, 50))
     img1 = base.convert("RGB")
-    img2 = img1.rotate(8, expand=True)
-
-    f1, _ = extract_outline_signature(img1)
-    f2, _ = extract_outline_signature(img2)
-    d = outline_distance(f1, f2)
-    assert d < 0.8, f"distance too large for similar shapes: {d}"
-    print("Self-test passed, distance:", d)
+    img2 = img1.rotate(10, expand=True)
+    f1, _ = extract_outline_features(img1)
+    f2, _ = extract_outline_features(img2)
+    d, comps = fused_outline_distance(f1, f2)
+    assert d < 1.0, f"distance too large for similar shapes: {d} {comps}"
+    print("Self-test passed:", d, comps)
 
 if __name__ == "__main__" and os.getenv("RUN_KEY_APP_TESTS") == "1":
     _run_self_tests()

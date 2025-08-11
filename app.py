@@ -49,6 +49,7 @@ import pandas as pd
 from PIL import Image, ImageOps
 import imagehash
 import streamlit as st
+from cv_key import extract_shape_features, ShapeFeatures, match_score  # new
 
 # ---------------------------
 # Constants & Paths
@@ -87,6 +88,19 @@ CREATE TABLE IF NOT EXISTS keys (
 );
 """
 
+SCHEMA_SQL_SHAPES = """
+CREATE TABLE IF NOT EXISTS key_shapes (
+    key_id INTEGER PRIMARY KEY,
+    svg TEXT,
+    hu TEXT,           -- JSON list[float]
+    fourier TEXT,      -- JSON list[float]
+    contour TEXT,      -- JSON list[[x,y], ...] length ~256
+    width INTEGER,
+    height INTEGER,
+    FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+);
+"""
+
 @dataclass
 class KeyRecord:
     id: int
@@ -101,6 +115,42 @@ class KeyRecord:
     whash: Optional[str]
     created_at: str
 
+# --- Optional live capture with overlay ---
+try:
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+    import av
+    import cv2  # you already use cv2 inside cv_key; keep this import here too for overlay drawing
+    STREAM_WEBRTC_OK = True
+except Exception:
+    STREAM_WEBRTC_OK = False
+
+import threading
+_frame_lock = threading.Lock()
+_last_frame = None
+
+class FramingOverlay(VideoProcessorBase):
+    def recv(self, frame):
+        global _last_frame
+        img = frame.to_ndarray(format="bgr24")
+        h, w = img.shape[:2]
+
+        # Draw a translucent guide box (centered)
+        box_w, box_h = int(0.7 * w), int(0.35 * h)
+        x0 = (w - box_w) // 2
+        y0 = (h - box_h) // 2
+        x1, y1 = x0 + box_w, y0 + box_h
+
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (255, 255, 255), thickness=2)
+        # center crosshair
+        cv2.line(overlay, (x0, (y0 + y1)//2), (x1, (y0 + y1)//2), (255, 255, 255), 1)
+        cv2.line(overlay, ((x0 + x1)//2, y0), ((x0 + x1)//2, y1), (255, 255, 255), 1)
+
+        img = cv2.addWeighted(overlay, 0.25, img, 0.75, 0)
+
+        with _frame_lock:
+            _last_frame = img.copy()
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -111,7 +161,55 @@ def get_conn() -> sqlite3.Connection:
 def init_db() -> None:
     with get_conn() as conn:
         conn.execute(SCHEMA_SQL)
+        conn.execute(SCHEMA_SQL_SHAPES)
 
+def insert_key_shape(key_id: int, svg: Optional[str], feats: Dict[str, object]) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO key_shapes (key_id, svg, hu, fourier, contour, width, height)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                key_id,
+                svg,
+                json.dumps(feats["hu"]),
+                json.dumps(feats["fourier"]),
+                json.dumps(feats["contour"]),
+                int(feats["width"]),
+                int(feats["height"]),
+            ),
+        )
+        conn.commit()
+
+
+def fetch_key_shapes() -> List[Dict[str, object]]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT k.id, k.name, k.purpose, k.image_path,
+                   s.svg, s.hu, s.fourier, s.contour, s.width, s.height
+            FROM keys k
+            JOIN key_shapes s ON s.key_id = k.id
+            ORDER BY k.created_at DESC
+        """)
+        rows = cur.fetchall()
+    out = []
+    for row in rows:
+        (kid, name, purpose, image_path, svg, hu, fourier, contour, w, h) = row
+        out.append({
+            "id": kid,
+            "name": name,
+            "purpose": purpose,
+            "image_path": image_path,
+            "svg": svg,
+            "hu": json.loads(hu),
+            "fourier": json.loads(fourier),
+            "contour": json.loads(contour),
+            "width": w,
+            "height": h,
+        })
+    return out
 
 def insert_key(name: str, purpose: str, description: str, tags: str, image_path: str, 
                hash_dict: Dict[str, Optional[str]]) -> int:
@@ -347,6 +445,49 @@ with tabs[0]:
 
     if target_img is not None:
         st.image(target_img, caption="Scanned image", width=400)
+        # ---------- Shape-based matching (primary) ----------
+        shape_records = fetch_key_shapes()
+        if not shape_records:
+            st.info("No shape features yet. Add keys or run the maintenance task in Export/Import to backfill.")
+        else:
+            try:
+                q_feats, q_svg, dbg = extract_shape_features(target_img)
+                st.image(dbg, caption="Detected silhouette & contour", width=400)
+
+                # Score against all stored shapes
+                scored = []
+                for rec in shape_records:
+                    cand = ShapeFeatures(
+                        width=rec["width"], height=rec["height"],
+                        hu=rec["hu"], fourier=rec["fourier"], contour=rec["contour"]
+                    )
+                    s = match_score(q_feats, cand)  # lower is better
+                    scored.append((rec, s))
+                scored.sort(key=lambda x: x[1])
+
+                # Controls for shape ranking
+                shape_thresh = st.slider("Shape match threshold (lower is better)", 0.0, 3.0, 0.65, 0.01,
+                                        help="Tune until your true matches are ≤ this value.")
+                topk_shape = st.slider("Top K (shape)", 1, 15, 5)
+
+                top_shape = scored[:topk_shape]
+                if top_shape:
+                    best_rec, best_score = top_shape[0]
+                    verdict = "✅ Likely match" if best_score <= shape_thresh else "⚠️ Uncertain match"
+                    st.markdown(f"### {verdict}: **{best_rec['name']}** (shape score {best_score:.3f})")
+                    with st.expander("Top candidates (shape)"):
+                        for rec, s in top_shape:
+                            st.write(f"- #{rec['id']} — **{rec['name']}** (purpose: {rec['purpose']}) — score **{s:.3f}**")
+                            if rec.get("svg"):
+                                st.markdown(
+                                    f"""<div style='background:#fafafa;border:1px solid #eee;padding:8px'>{rec['svg']}</div>""",
+                                    unsafe_allow_html=True
+                                )
+            except Exception as e:
+                st.warning(f"Shape matching failed: {e}")
+
+        # ---------- Perceptual-hash matching (fallback/secondary) ----------
+
         hashes = compute_hashes(target_img)
         matches = find_best_matches(hashes, top_k=topk)
 
@@ -377,11 +518,50 @@ with tabs[0]:
                     img_path = _save_image(target_img, suggested_name=name or "scan")
                     new_id = insert_key(name, purpose or "(unspecified)", description, tags, img_path, hashes)
                     st.success(f"Saved new key #{new_id}")
+                    # Compute and store shape features for this new key
+                    try:
+                        feats, svg, _dbg = extract_shape_features(Image.open(img_path).convert("RGB"))
+                        insert_key_shape(
+                            new_id,
+                            svg,
+                            {
+                                "hu": feats.hu,
+                                "fourier": feats.fourier,
+                                "contour": feats.contour,
+                                "width": feats.width,
+                                "height": feats.height,
+                            },
+                        )
+                    except Exception as e:
+                        st.warning(f"Saved key #{new_id}, but shape features failed: {e}")
 
 # --- Tab: Add Key ---
 with tabs[1]:
     st.subheader("Add a new key to your database")
     st.write("Capture or upload a photo and fill in the details.")
+    st.markdown("##### Framing guide (align the key inside the box, blade horizontal)")
+    use_live = st.toggle("Use live capture with overlay", value=False)
+    if use_live and STREAM_WEBRTC_OK:
+        ctx = webrtc_streamer(
+            key="key-cam",
+            video_processor_factory=FramingOverlay,
+            media_stream_constraints={"video": True, "audio": False},
+        )
+        colA, colB = st.columns([1,1])
+        with colA:
+            if st.button("Capture still from live video"):
+                with _frame_lock:
+                    frame = None if _last_frame is None else _last_frame.copy()
+                if frame is not None:
+                    add_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    source_name = "live-capture"
+                    st.success("Captured!")
+
+                else:
+                    st.warning("No frame available yet.")
+    else:
+        if use_live and not STREAM_WEBRTC_OK:
+            st.info("Install live capture deps: pip install streamlit-webrtc av opencv-python-headless")
 
     add_cam = st.camera_input("Take a photo (webcam)", key="add_cam")
     add_upl = st.file_uploader("…or upload an image", type=["jpg", "jpeg", "png"], key="add_upl")
@@ -409,6 +589,23 @@ with tabs[1]:
                 path = _save_image(add_img, suggested_name=name)
                 new_id = insert_key(name, purpose, description, tags, path, hashes)
                 st.success(f"Added key #{new_id}")
+
+                # Compute and store shape features for this new key
+                try:
+                    feats, svg, _dbg = extract_shape_features(Image.open(path).convert("RGB"))
+                    insert_key_shape(
+                        new_id,
+                        svg,
+                        {
+                            "hu": feats.hu,
+                            "fourier": feats.fourier,
+                            "contour": feats.contour,
+                            "width": feats.width,
+                            "height": feats.height,
+                        },
+                    )
+                except Exception as e:
+                    st.warning(f"Added key #{new_id}, but shape features failed: {e}")
 
 # --- Tab: My Keys ---
 with tabs[2]:
@@ -501,6 +698,29 @@ with tabs[3]:
                     st.success(f"Imported {count} records.")
             except Exception as e:
                 st.error(f"Import failed: {e}")
+    with st.expander("Shape features maintenance", expanded=False):
+        if st.button("Compute/refresh shape features for all keys"):
+            df_all = fetch_keys_df()
+            ok, fail = 0, 0
+            for _, r in df_all.iterrows():
+                try:
+                    p = str(r["image_path"])
+                    feats, svg, _ = extract_shape_features(Image.open(p).convert("RGB"))
+                    insert_key_shape(
+                        int(r["id"]),
+                        svg,
+                        {
+                            "hu": feats.hu,
+                            "fourier": feats.fourier,
+                            "contour": feats.contour,
+                            "width": feats.width,
+                            "height": feats.height,
+                        },
+                    )
+                    ok += 1
+                except Exception as e:
+                    fail += 1
+            st.success(f"Shape features updated. OK: {ok}, failed: {fail}")
 
 st.divider()
 st.caption("Tip: Use consistent lighting and a plain background when photographing keys to improve matching quality.")

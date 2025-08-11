@@ -3,3 +3,7 @@ pillow
 imagehash
 numpy
 pandas
+opencv-python-headless
+rembg
+streamlit-webrtc
+av

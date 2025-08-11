@@ -839,6 +839,8 @@ with tabs[3]:
                                 ),
                             )
                             count += 1
+                        except Exception:
+                            pass
                     conn.commit()
                 st.success(f"Imported/updated {count} SHAPES rows.")
             except Exception as e:
@@ -851,12 +853,6 @@ with tabs[3]:
             ok, fail = 0, 0
             for _, r in df_all.iterrows():
                 try:
-                    p = str(r["image_path"])
-                    feats, _ = extract_and_describe(Image.open(p).convert("RGB"))
-                    insert_key_shape_row(int(r["id"]), feats, svg=None)
-                    ok += 1
-                except Exception:
-                    fail += 1
                     p = str(r["image_path"])
                     feats, _ = extract_and_describe(Image.open(p).convert("RGB"))
                     insert_key_shape_row(int(r["id"]), feats, svg=None)

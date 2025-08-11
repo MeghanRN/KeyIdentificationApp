@@ -181,40 +181,58 @@ def _zernike(mask: np.ndarray, radius: int = 64, n: int = 8) -> Optional[List[fl
                 feats.append(abs(moments_zernike(img, radius, order, repetition)))
     return feats
 
-def _elliptic_fourier_descriptors(contour: np.ndarray, harmonics: int = 20) -> List[float]:
+def _elliptic_fourier_descriptors(contour: np.ndarray, harmonics: int = 24) -> List[float]:
     """
-    Simple EFD implementation: compute coefficients and normalize for translation/scale/rotation.
-    Reference: Kuhl & Giardina 1982.
+    Stable EFD implementation (translation/scale normalized).
+    Reference: Kuhl & Giardina (1982).
     """
-    pts = contour.astype(np.float64)
+    pts = np.asarray(contour, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 2:
+        raise ValueError("Contour must be Nx2.")
+
     # Ensure closed contour
     if not np.allclose(pts[0], pts[-1]):
         pts = np.vstack([pts, pts[0]])
 
-    # Differential
-    dxy = np.diff(pts, axis=0)
-    dt = np.sqrt((dxy**2).sum(1))
-    t = np.hstack([[0.0], np.cumsum(dt)])
-    T = t[-1] if t[-1] > 0 else 1.0
+    # Segment vectors and lengths
+    dxy = np.diff(pts, axis=0)                      # shape: M x 2
+    dt = np.linalg.norm(dxy, axis=1)                # shape: M
+    eps = 1e-8
+    dt_safe = np.where(dt < eps, 1.0, dt)
 
-    # EFD coefficients (a_n, b_n, c_n, d_n), normalized by first harmonic for invariance
+    # Cumulative parameter t (length M+1), total length T
+    t = np.concatenate(([0.0], np.cumsum(dt)))      # shape: M+1
+    T = t[-1] if t[-1] > eps else 1.0
+
     coeffs = []
-    for n in range(1, harmonics+1):
-        cn = (2*np.pi*n)/T
-        cos_ct = np.cos(cn*t[:-1]); sin_ct = np.sin(cn*t[:-1])
-        dx = dxy[:,0]; dy = dxy[:,1]
-        a_n = (1/(cn**2*T)) * np.sum(dx * (sin_ct[1:] - sin_ct[:-1]))
-        b_n = (1/(cn**2*T)) * np.sum(dx * (-cos_ct[1:] + cos_ct[:-1]))
-        c_n = (1/(cn**2*T)) * np.sum(dy * (sin_ct[1:] - sin_ct[:-1]))
-        d_n = (1/(cn**2*T)) * np.sum(dy * (-cos_ct[1:] + cos_ct[:-1]))
-        coeffs.append([a_n, b_n, c_n, d_n])
-    coeffs = np.array(coeffs)
+    for n in range(1, harmonics + 1):
+        cn = 2.0 * np.pi * n / T
 
-    # Normalize by first harmonic magnitude to remove scale/rotation
-    a1,b1,c1,d1 = coeffs[0]
-    norm = math.sqrt(a1*a1 + b1*b1 + c1*c1 + d1*d1) + 1e-12
-    efd_norm = (coeffs / norm).flatten()
-    return efd_norm.tolist()
+        # Trig at segment endpoints (aligned lengths)
+        cos_ti  = np.cos(cn * t[:-1])               # length M
+        cos_ti1 = np.cos(cn * t[ 1:])               # length M
+        sin_ti  = np.sin(cn * t[:-1])
+        sin_ti1 = np.sin(cn * t[ 1:])
+
+        dcos = cos_ti - cos_ti1                     # length M
+        dsin = sin_ti - sin_ti1
+
+        # Kuhl–Giardina coefficients
+        k = T / (2.0 * (np.pi ** 2) * (n ** 2))
+        a_n = k * np.sum((dxy[:, 0] / dt_safe) * dcos)
+        b_n = k * np.sum((dxy[:, 0] / dt_safe) * dsin)
+        c_n = k * np.sum((dxy[:, 1] / dt_safe) * dcos)
+        d_n = k * np.sum((dxy[:, 1] / dt_safe) * dsin)
+        coeffs.append([a_n, b_n, c_n, d_n])
+
+    coeffs = np.asarray(coeffs, dtype=np.float64)
+
+    # Scale normalization (rotation is already largely handled by canonicalization)
+    a1, b1, c1, d1 = coeffs[0]
+    scale = np.sqrt(a1*a1 + b1*b1 + c1*c1 + d1*d1) + 1e-12
+    coeffs = coeffs / scale
+
+    return coeffs.flatten().tolist()
 
 def _blade_bitting_profile(mask: np.ndarray, samples: int = 160) -> List[float]:
     """

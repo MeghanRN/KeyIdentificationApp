@@ -857,6 +857,12 @@ with tabs[3]:
                     ok += 1
                 except Exception:
                     fail += 1
+                    p = str(r["image_path"])
+                    feats, _ = extract_and_describe(Image.open(p).convert("RGB"))
+                    insert_key_shape_row(int(r["id"]), feats, svg=None)
+                    ok += 1
+                except Exception:
+                    fail += 1
             st.success(f"Shape features updated. OK: {ok}, failed: {fail}")
 
 st.divider()

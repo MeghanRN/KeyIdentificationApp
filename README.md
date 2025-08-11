@@ -1,283 +1,293 @@
-# Key Identification App — README
+# Key Identification App
 
-A local-first Streamlit app to **scan/upload a key photo** and **identify** which of your saved keys it matches—plus a simple database to **add, search, and manage** your own keys. No cloud, no accounts; everything stays on your machine.
+Scan a key (camera or upload) and identify which **saved** key it matches. Create and manage a private database of your own keys. All data stays local.
 
----
-
-## What this app does (and doesn’t)
-
-* **Does:** compares a new photo of a key against *your* saved key photos using **perceptual image hashing**; shows the best matches with a numeric similarity score; lets you add, delete, search, export, and import your key records.
-* **Doesn’t:** decode bitting, cut keys, or identify manufacturers/lock models. Results are **similarity-based**, not forensic identification.
+This version uses a **single, unified identification pipeline** that’s robust to background, rotation, and small pose/scale changes—no need to take “the exact same photo” anymore.
 
 ---
 
-## Quick start
+# Quick start
 
-### Requirements
+1. (Recommended) Create & activate a virtual environment
 
-* **Python** 3.9+
-* macOS, Windows, or Linux
-* Camera access (optional, for webcam capture)
+   ```bash
+   python -m venv .venv
+   # Windows
+   .venv\Scripts\activate
+   # macOS/Linux
+   source .venv/bin/activate
+   ```
 
-### Install
+2. Install dependencies
+   (you can paste this to a `requirements.txt` or install directly)
 
-```bash
-# optional: create a virtual env
-python -m venv .venv
-# Windows
-.venv\Scripts\activate
-# macOS/Linux
-source .venv/bin/activate
+   ```bash
+   pip install streamlit pillow numpy pandas imagehash opencv-python scikit-image rembg
+   ```
 
-# install deps
-pip install -r requirements.txt
-# or, install directly:
-pip install streamlit pillow imagehash numpy pandas
+   * `rembg` is optional but strongly recommended for best background removal.
+   * If your platform needs it, you can use `opencv-python-headless` instead of `opencv-python`.
+
+3. Run the app
+
+   ```bash
+   streamlit run app.py
+   ```
+
+---
+
+# What’s new (tech highlights)
+
+* **Unified pipeline** for every image:
+
+  * **Background removal** using **U²-Net** via `rembg` (falls back to robust OpenCV thresholding if `rembg` isn’t available).
+  * **Canonicalization**: auto-rotates the silhouette with PCA so the blade is horizontal, flips so the blade points right, and normalizes scale.
+  * **Descriptors (features) per key**:
+
+    * **Elliptic Fourier Descriptors (EFD)** of the closed contour (rotation/scale invariant global shape).
+    * **Hu** + **Zernike** moments on the normalized mask (global shape invariants).
+    * **Bitting profile**: a 1-D curve of tooth depth along the blade, matched with **DTW** (Dynamic Time Warping).
+    * **Edge/contour distance**: **Hausdorff** (or Chamfer fallback) between silhouettes.
+    * **Local features**: **ORB** descriptors on edges as a tie-breaker.
+  * **Two-stage retrieval**:
+
+    1. Coarse shortlist with global shape (EFD + Hu + Zernike).
+    2. Re-rank with Hausdorff/Chamfer + DTW (bitting) + ORB inlier ratio.
+  * **Score fusion**: components are combined with tuned weights into one final score (lower is better).
+* **Database schema** extended to store **Zernike**, **bitting**, and **ORB** so you get the **full fused score immediately** for past and new keys.
+* **One capture flow** (camera or upload) — no more parallel code paths.
+
+---
+
+# How it works
+
+1. **Segmentation**
+   We remove the background with U²-Net (`rembg`) if available; otherwise, an OpenCV fallback:
+
+   * Gray → CLAHE → adaptive threshold → morphology → keep largest component.
+
+2. **Canonicalization**
+
+   * PCA finds the major axis → rotate to horizontal.
+   * Flip if needed so the blade faces right.
+   * Normalize to a standard height (scale invariance).
+
+3. **Feature extraction**
+
+   * **EFD**: 24 harmonics (configurable) → rotation/scale/translation invariant contour signature.
+   * **Hu moments** (on binary mask, log-scaled).
+   * **Zernike moments** (requires `scikit-image`) — optional, but we store when available.
+   * **Bitting profile**: sample tooth depth along the blade (right \~60% of mask) into a normalized 1-D vector.
+   * **ORB**: detect/describe edge keypoints for local similarity.
+
+4. **Matching & score**
+
+   * Compute distances:
+
+     * `efd`: L2(EFD vectors)
+     * `hu`: L2(Hu vectors)
+     * `zern`: L2(Zernike vectors) if both keys have it
+     * `haus`: Hausdorff (or Chamfer-like fallback) between silhouettes
+     * `dtw`: DTW distance between bitting curves
+     * `orb`: 1 − inlier\_ratio (Lowe ratio test on ORB matches)
+   * Fuse with weights (defaults):
+
+     ```
+     0.30*efd + 0.12*hu + 0.08*zern + 0.30*haus + 0.15*dtw + 0.05*orb
+     ```
+   * Lower is better. You can tune the **accept threshold** in the sidebar.
+
+5. **Auxiliary view (legacy)**
+   We still compute perceptual hashes (a/p/d/w) as a secondary/diagnostic view; the **primary verdict** is the fused shape score.
+
+---
+
+# Project structure
+
+```
+.
+├── app.py                # Streamlit app (UI + DB)
+├── cv_key.py             # CV pipeline: segmentation, features, scoring
+├── data/
+│   ├── images/           # saved key images
+│   ├── exports/          # CSV/JSON exports
+│   └── keys.db           # SQLite database
+└── requirements.txt      # dependencies (optional)
 ```
 
-**requirements.txt** (optional)
+---
 
-```
-streamlit
-pillow
-ImageHash
-numpy
-pandas
-```
+# Database
 
-> `ImageHash` brings in PyWavelets for wavelet hashing automatically.
+We use SQLite (`data/keys.db`) with two tables:
 
-### Run
+## `keys`
 
-```bash
-streamlit run app.py
-```
+| column                  | type | note                        |
+| ----------------------- | ---- | --------------------------- |
+| id (PK)                 | int  | autoincrement               |
+| name                    | text | user-provided               |
+| purpose                 | text | user-provided               |
+| description             | text | optional                    |
+| tags                    | text | optional                    |
+| image\_path             | text | local path to saved JPEG    |
+| ahash/phash/dhash/whash | text | perceptual hash hex strings |
+| created\_at             | text | default `CURRENT_TIMESTAMP` |
 
-* Your browser will open to the app UI.
-* If webcam capture is blocked, allow camera access in your browser.
+## `key_shapes`
+
+| column       | type | note                                                    |
+| ------------ | ---- | ------------------------------------------------------- |
+| key\_id PK   | int  | 1:1 with `keys.id`                                      |
+| svg          | text | optional (silhouette rendering)                         |
+| hu           | text | JSON list\[float]                                       |
+| fourier      | text | JSON list\[float] (EFD vector)                          |
+| contour      | text | JSON list\[\[x,y], ...] (canonicalized)                 |
+| width/height | int  | canonical mask size                                     |
+| zernike      | text | JSON list\[float] (optional; requires `scikit-image`)   |
+| bitting      | text | JSON list\[float] 1-D depth curve                       |
+| orb\_kp      | int  | number of ORB keypoints                                 |
+| orb\_desc    | text | JSON list of ORB descriptors (uint8 rows); can be large |
+
+> On upgrade, the app will **migrate** the `key_shapes` table to add missing columns.
 
 ---
 
-## How to use the app
+# Usage
 
-### Tabs overview
+## 1) Add a key
 
-1. **📷 Scan & Identify**
+* Go to **“➕ Add Key”**.
+* Capture or upload a photo (one unified control).
+* Fill in **Name** and **Purpose** (required).
+* Submit to save:
 
-   * Capture a photo via **webcam** or **upload** a JPG/PNG.
-   * The app computes four perceptual hashes and finds the **Top-K** closest matches from your database.
-   * You’ll see a **verdict**:
+  * The original image is saved in `data/images/`.
+  * The app computes and stores **all** shape features (EFD, Hu, Zernike, bitting, ORB).
 
-     * **✅ Likely match** if the combined score ≤ your threshold
-     * **⚠️ Uncertain match** otherwise
-   * Expand each candidate to see per-hash distances.
-   * Optionally **save** the scanned photo as a new key (fill name/purpose/tags).
+## 2) Identify a key
 
-2. **➕ Add Key**
+* Go to **“📷 Scan & Identify”**.
+* Capture or upload a photo of a **single** key on a plain background.
+* The app shows:
 
-   * Add a new key record by webcam or upload, fill details, and save.
-   * Hashes are computed automatically and stored alongside the image.
+  * Canonicalized silhouette preview.
+  * **Best match** and **score** (lower is better).
+  * **Top candidates** and a **breakdown** of component distances for the best candidate.
+  * (Optional) Perceptual-hash comparison as a secondary view.
 
-3. **🗂️ My Keys**
+## 3) Manage your keys
 
-   * Search by **name**, **purpose**, or **tags**.
-   * View each key as a card (image + metadata) and **delete** if needed.
-   * Expand “Table view” for a sortable grid.
+* **“🗂️ My Keys”** shows your saved keys.
+* Expand **Shape features** to see stored descriptors; bitting curve is plotted if available.
+* Delete a key from this screen (removes the image and DB row).
 
-4. **⤴️ Export / Import**
+## 4) Export / Import
 
-   * **Export** your database to **CSV** or **JSON** (saved under `data/exports/`).
-   * **Import** previously exported CSV/JSON.
-
-     * Required columns: `name`, `purpose`, `image_path`
-     * Optional: `description`, `tags`, `ahash`, `phash`, `dhash`, `whash`, `created_at`
-     * If hashes are missing but the image file exists, the app **recomputes** hashes.
-
-### Settings (left sidebar)
-
-* **Accept match if combined score ≤ N**
-  Default **35**. Lower is stricter (more similar).
-  Start around **35–45** and tune based on your photos/lighting.
-* **Top-K candidates**
-  Default **5**. Shows the top N matches for review.
-* Database path is shown for reference.
+* Export **KEYS** to CSV/JSON and **SHAPES** to JSON.
+* Import **KEYS** CSV/JSON (recomputes shape features for any rows that have accessible images).
+* Import **SHAPES** JSON to backfill features (requires corresponding key rows to exist).
+* **Maintenance**: “Compute/refresh ALL” recomputes *full* shape features for every key in the DB.
 
 ---
 
-## Data layout & privacy
+# Image capture tips
 
-All data is saved under `./data` next to `app.py`:
-
-* **SQLite DB**: `data/keys.db`
-* **Images**: `data/images/` (JPEG files saved on add/scan)
-* **Exports**: `data/exports/` (CSV/JSON)
-
-The app is **local-only**. It does not send images or data to any server.
+* Use a **plain, contrasting background** (paper, desk mat).
+* Keep the **blade roughly horizontal**. The app auto-rotates and flips, but good framing helps.
+* Avoid heavy glare; diffuse light is best.
+* Keep the entire key in frame; crop out any second object.
 
 ---
 
-## How identification works (the tech)
+# Settings & thresholds
 
-The app uses **perceptual image hashing** via the `ImageHash` library:
+In the sidebar:
 
-* **aHash** (Average Hash): averages luminance and thresholds pixels.
-* **pHash** (Perceptual Hash): DCT-based; robust to small changes.
-* **dHash** (Difference Hash): looks at gradients/adjacent pixel differences.
-* **wHash** (Wavelet Hash): wavelet transforms; robust to lighting changes.
+* **Fused shape accept threshold** (default `0.85`):
+  Lower is stricter. Typical good range is **0.6–1.2** depending on your photos.
 
-For a scanned photo, we compute all four hashes (hex strings) and compare them with each record’s stored hashes using **Hamming distance**:
+* **Top K (shape)**: how many candidates to show.
 
-* **Per-hash distance** = number of differing bits between two hashes (lower = more similar).
-* **Combined score** = sum of valid per-hash distances across the four hashes:
+* **Aux hash threshold** (default `35`) & **Top K (hash)**: diagnostic/secondary view.
 
+> Tuning tip: Add 5–10 keys first, test a few scans, then adjust the fused threshold until true matches land **below** it and non-matches stay **above** it.
+
+---
+
+# Troubleshooting
+
+* **“ImportError: cannot import name `extract_and_describe` from `cv_key`”**
+  Ensure you copied the **new** `cv_key.py` (the one that defines `extract_and_describe`).
+  If you can’t update immediately, there’s a compatibility shim you can drop into `app.py` to wrap the old `extract_shape_features`.
+
+* **`rembg` not installed or fails**
+  The app automatically falls back to an OpenCV thresholding pipeline. For best results, `pip install rembg`.
+
+* **OpenCV conflicting builds**
+  Some environments prefer `opencv-python-headless`. Uninstall `opencv-python` and install `opencv-python-headless`.
+
+* **Zernike not computed**
+  Requires `scikit-image`. Install it and recompute features from **Export/Import → “Compute/refresh ALL”**.
+
+* **Score seems too high/low**
+  Adjust the **fused threshold** in the sidebar. Make sure training photos are clean, single-key, and reasonably close.
+
+* **Switching cameras**
+  `st.camera_input` uses the **browser’s** selected camera. Change it in your browser’s site settings (Chrome: `chrome://settings/content/camera`, Safari: Settings → Websites → Camera, etc.), then reload.
+
+---
+
+# Privacy & data
+
+* Everything is local to the `data/` folder:
+
+  * DB at `data/keys.db`
+  * Images under `data/images/`
+  * Exports under `data/exports/`
+* Keep this folder private. The app is for **personal** record-keeping only.
+
+---
+
+# Development & tests
+
+* Minimal self-tests exist and can be run with:
+
+  ```bash
+  # Windows
+  set RUN_KEY_APP_TESTS=1 && streamlit run app.py
+  # macOS/Linux
+  RUN_KEY_APP_TESTS=1 streamlit run app.py
   ```
-  combined = ahash_dist + phash_dist + dhash_dist + whash_dist
-  ```
 
-  If a stored hash is missing for a record, it’s skipped in the sum.
+  They check basic hashing and a shape smoke test.
 
-We then **sort ascending** by the combined score and show the top matches.
-
-### Why multiple hashes?
-
-Each hash is robust to different perturbations (noise, rotation, lighting). Summing several distances gives a more stable similarity metric than relying on a single hash.
+* Recommended Python versions: 3.9–3.11 (works on newer too, but CV stacks vary by platform).
 
 ---
 
-## Tips for better matches
+# Roadmap (optional ideas)
 
-* Photograph keys **face-on** on a **plain, high-contrast background**.
-* Keep lighting consistent; avoid heavy shadows or glare.
-* Use similar **scale and orientation** for new scans vs. saved images.
-* Save **both sides** of a key as separate records if needed (e.g., unique markings).
-
----
-
-## Database schema
-
-```sql
-CREATE TABLE IF NOT EXISTS keys (
-  id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL,
-  purpose TEXT NOT NULL,
-  description TEXT,
-  tags TEXT,
-  image_path TEXT NOT NULL,
-  ahash TEXT,
-  phash TEXT,
-  dhash TEXT,
-  whash TEXT,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-```
+* **Small learned re-ranker** (Siamese / triplet) on your private dataset for even tighter ranking.
+* **SVG export** of canonical silhouette (currently stored as contour; can render on demand).
+* **Mobile PWA wrapper** for a more camera-native feel.
 
 ---
 
-## Export/Import formats
+# FAQ
 
-### CSV example
+**Q: Can it identify the brand/lock model or decode bitting numbers?**
+A: No. It performs **visual similarity matching** against *your* saved keys. It doesn’t decode keyways/bitting specs.
 
-```csv
-id,name,purpose,description,tags,image_path,ahash,phash,dhash,whash,created_at
-1,Front Door,Home Entry,,home,./data/images/20250101_key1.jpg,ff00...,aa11...,bb22...,cc33...,2025-01-01T12:34:56
-```
+**Q: Do I have to use `rembg`?**
+A: No, but you’ll get more robust segmentation with it.
 
-### JSON example
-
-```json
-[
-  {
-    "name": "Garage",
-    "purpose": "Garage Door",
-    "description": "",
-    "tags": "home,outdoor",
-    "image_path": "./data/images/20250101_garage.jpg",
-    "ahash": "ff00...",
-    "phash": "aa11...",
-    "dhash": "bb22...",
-    "whash": "cc33...",
-    "created_at": "2025-01-02T08:00:00"
-  }
-]
-```
-
-**Import rules**
-
-* Must include: `name`, `purpose`, `image_path`.
-* If any hash is missing and `image_path` exists, the app **recomputes** it.
-* Import does **not** copy image files; it references the paths you provide.
+**Q: Can I store thousands of keys?**
+A: Technically yes; precomputing and caching features is designed for that. For very large sets, consider periodic exports and SSD storage.
 
 ---
 
-## Testing & diagnostics
+# License & acknowledgments
 
-### Built-in self-tests (don’t touch your DB)
-
-Run minimal checks for hashing/distance logic:
-
-```bash
-RUN_KEY_APP_TESTS=1 python app.py
-```
-
-You should see: `All self-tests passed ✔️`
-
-### Common issues & fixes
-
-* **`TabError: inconsistent use of tabs and spaces`**
-  The app uses **spaces-only** indentation. Ensure your editor converts tabs to spaces. (This repo/version already standardizes indentation.)
-
-* **`ModuleNotFoundError: No module named 'imagehash'`**
-  Install dependencies: `pip install -r requirements.txt` (or `pip install ImageHash`).
-
-* **Webcam not available / permission denied**
-
-  * Use Chrome/Edge/Firefox, and allow camera access when prompted.
-  * Or skip webcam and use **Upload**.
-
-* **Blank or wrong matches**
-
-  * Check lighting/background.
-  * Raise/lower the threshold in the sidebar.
-  * Add more high-quality reference photos.
-
-* **Images missing after import**
-  Import expects `image_path` to exist on disk. Copy image files to the target machine and update paths if needed.
-
----
-
-## Performance notes
-
-* Hash computation is fast (tiny downsampled images + DCT/wavelet).
-* Database reads are lightweight; everything is local SQLite.
-* Large collections: consider pruning duplicates and keeping images ≤ \~2–3 MB.
-
----
-
-## Security & privacy
-
-* **Local-only** app: no network calls.
-* Keep `./data/` private (especially images).
-* If you back up or share the DB, remember it references **real photos of your keys**.
-
----
-
-## Roadmap ideas (optional)
-
-* Optional **feature matching** (ORB/SIFT) for a second-stage re-rank.
-* Bulk image import & auto-tagging.
-* Duplicate detector / “are these the same key?” helper.
-* Mobile packaging (Streamlit Community Cloud or PWA wrapper).
-
----
-
-## Contributing & coding style
-
-* Indentation: **spaces only** (no tabs).
-* Keep UI elements inside the correct container (tabs belong in the main area, not the sidebar).
-* Prefer small, composable helpers in the image/hash layer.
-
----
-
-## License & disclaimer
-
-This tool is intended for **personal record-keeping**. Do not use it for security-sensitive decision making. The similarity scores are heuristic and may be wrong.
+* Built with **Streamlit**, **OpenCV**, **scikit-image**, **rembg (U²-Net)**, and **Pillow**.
+* You own your data; keep it private and comply with local laws.

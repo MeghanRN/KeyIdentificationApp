@@ -276,7 +276,7 @@ def key_card(rec: KeyRecord, shape_row: Optional[Dict[str, object]] = None):
             if st.button("Delete", type="secondary", key=f"del_{rec.id}"):
                 delete_key(rec.id)
                 st.success(f"Deleted key #{rec.id}")
-                st.experimental_rerun()
+                st.rerun()
 
 # ---------------------------
 # App

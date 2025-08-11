@@ -13,7 +13,7 @@ class OutlineFeatures:
     contour: List[List[int]]     # Nx2 integer points (clockwise or ccw)
     signature: List[float]       # 1-D normalized radial signature (length SIG_LEN)
 
-SIG_LEN = 256  # number of samples along the outline
+SIG_LEN = 1024  # number of samples along the outline
 
 # ---------------------------
 # Core extraction

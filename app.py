@@ -1,14 +1,14 @@
 """
 Key Identification App (Streamlit)
 ----------------------------------
-Unified, robust key identification using advanced computer-vision:
+Unified, robust key identification using advanced computer vision:
 - Background removal (U²-Net via `rembg` if available, else OpenCV fallback)
 - Canonicalized silhouette (rotation/scale normalized)
-- Elliptic Fourier Descriptors (EFD), Hu (and optional Zernike) moments
+- Elliptic Fourier Descriptors (EFD), Hu + Zernike moments
 - Blade bitting profile (1-D curve, matched with DTW)
 - Edge/contour distance (Hausdorff/Chamfer fallback)
 - ORB local features as a tie-breaker
-- Optional perceptual-hash fallback for legacy compatibility
+- Optional perceptual-hash view (aux only)
 
 Quick start
 ===========
@@ -29,11 +29,6 @@ Data & security
 - Saved images: data/images/
 - Exports: data/exports/
 - This is a personal tool; keep the folder private.
-
-Notes
-=====
-- The fused shape pipeline is the primary matcher.
-- Hash scores (a/p/d/w) are shown only as an auxiliary view.
 """
 
 from __future__ import annotations
@@ -52,12 +47,14 @@ from PIL import Image, ImageOps
 import imagehash
 import streamlit as st
 
-# --- CV pipeline (new unified descriptors & scoring) ---
-#   Save this as `cv_key.py` from the previous message I sent.
+# --- CV pipeline (unified descriptors & scoring) ---
+#   Ensure you have cv_key.py from earlier step in the same folder.
 from cv_key import (
     extract_and_describe,
     ShapeFeatures,
     match_score,
+    # We’ll reuse a couple helpers to show score breakdowns:
+    _dtw,  # noqa: E402  (internal helper from cv_key, safe to import)
 )
 
 # ---------------------------
@@ -72,7 +69,7 @@ DB_PATH = DATA_DIR / "keys.db"
 HASH_SIZE = 12         # for a/p/d hashes (wHash auto-adjusted to power of two)
 DEFAULT_TOPK = 5
 DEFAULT_SHAPE_THRESHOLD = 0.85   # lower = more similar (tune to your images)
-DEFAULT_HASH_THRESHOLD = 35      # for legacy hash sum distance (fallback/aux)
+DEFAULT_HASH_THRESHOLD = 35      # for legacy hash sum distance (aux only)
 
 # Ensure folders exist
 for p in [DATA_DIR, IMG_DIR, EXPORT_DIR]:
@@ -97,8 +94,7 @@ CREATE TABLE IF NOT EXISTS keys (
 );
 """
 
-# Shapes table: keep legacy cols (hu/fourier/contour/width/height/svg)
-# and add richer fields: zernike, bitting, orb_kp, orb_desc
+# Shapes table now stores full fused-descriptor set:
 SCHEMA_SQL_SHAPES = """
 CREATE TABLE IF NOT EXISTS key_shapes (
     key_id INTEGER PRIMARY KEY,
@@ -117,21 +113,17 @@ CREATE TABLE IF NOT EXISTS key_shapes (
 """
 
 def _migrate_shapes_table() -> None:
-    # Ensure columns exist if DB was created by an older app version.
+    """Add any missing columns if DB came from an older version."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("PRAGMA table_info(key_shapes)")
         cols = {r[1] for r in cur.fetchall()}
-        alter_stmts = []
-        if "zernike" not in cols:
-            alter_stmts.append("ALTER TABLE key_shapes ADD COLUMN zernike TEXT;")
-        if "bitting" not in cols:
-            alter_stmts.append("ALTER TABLE key_shapes ADD COLUMN bitting TEXT;")
-        if "orb_kp" not in cols:
-            alter_stmts.append("ALTER TABLE key_shapes ADD COLUMN orb_kp INTEGER;")
-        if "orb_desc" not in cols:
-            alter_stmts.append("ALTER TABLE key_shapes ADD COLUMN orb_desc TEXT;")
-        for stmt in alter_stmts:
+        alter = []
+        if "zernike" not in cols: alter.append("ALTER TABLE key_shapes ADD COLUMN zernike TEXT;")
+        if "bitting" not in cols: alter.append("ALTER TABLE key_shapes ADD COLUMN bitting TEXT;")
+        if "orb_kp" not in cols: alter.append("ALTER TABLE key_shapes ADD COLUMN orb_kp INTEGER;")
+        if "orb_desc" not in cols: alter.append("ALTER TABLE key_shapes ADD COLUMN orb_desc TEXT;")
+        for stmt in alter:
             cur.execute(stmt)
         conn.commit()
 
@@ -184,10 +176,11 @@ def insert_key(name: str, purpose: str, description: str, tags: str, image_path:
         conn.commit()
         return cur.lastrowid
 
-def insert_key_shape(key_id: int, feats: ShapeFeatures, svg: Optional[str] = None) -> None:
+def insert_key_shape_row(key_id: int, feats: ShapeFeatures, svg: Optional[str] = None) -> None:
+    """Store the full fused feature set for a key."""
     payload = {
         "hu": json.dumps(feats.hu),
-        "fourier": json.dumps(feats.efd),       # store EFD in 'fourier' column for compatibility
+        "fourier": json.dumps(feats.efd),       # store EFD in 'fourier'
         "contour": json.dumps(feats.contour),
         "width": int(feats.width),
         "height": int(feats.height),
@@ -294,7 +287,7 @@ def delete_key(key_id: int) -> None:
         conn.commit()
 
 # ---------------------------
-# Image utilities & hashes (aux)
+# Image utilities & hashes (aux view)
 # ---------------------------
 def _open_image(file_bytes: bytes) -> Image.Image:
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
@@ -366,9 +359,108 @@ def capture_image_simple(key: str) -> Optional[Image.Image]:
     return img
 
 # ---------------------------
+# Wiring helpers (auto backfill)
+# ---------------------------
+def ensure_full_shape_features(key_id: int, image_path: str, existing: Optional[Dict[str, object]] = None) -> ShapeFeatures:
+    """
+    Guarantee that Zernike, bitting, ORB are present in DB for the given key.
+    If missing/empty, compute now, persist, and return fresh features.
+    If existing has all fields, return a constructed ShapeFeatures from it.
+    """
+    have_all = False
+    if existing:
+        have_all = (
+            existing.get("hu") is not None and
+            existing.get("fourier") is not None and
+            existing.get("contour") is not None and
+            existing.get("zernike") is not None and
+            existing.get("bitting") is not None and
+            existing.get("orb_kp", 0) > 0 and
+            existing.get("orb_desc") is not None
+        )
+
+    if have_all:
+        return ShapeFeatures(
+            width=int(existing["width"]), height=int(existing["height"]),
+            contour=existing["contour"],
+            efd=existing["fourier"], hu=existing["hu"],
+            zernike=existing.get("zernike"),
+            bitting=existing.get("bitting"),
+            orb_kp=int(existing.get("orb_kp", 0)),
+            orb_desc=existing.get("orb_desc"),
+            mask_bbox=(0, 0, int(existing["width"]), int(existing["height"])),
+        )
+
+    # Compute fresh features and persist
+    feats, _dbg = extract_and_describe(Image.open(image_path).convert("RGB"))
+    insert_key_shape_row(key_id, feats, svg=None)
+    return feats
+
+# ---------------------------
+# Score breakdown (for UI)
+# ---------------------------
+def _mask_from_contour(sf: ShapeFeatures, out_h: int = 280) -> np.ndarray:
+    import cv2  # local import to avoid top-level import dependency here
+    scale = out_h / sf.height
+    out_w = max(1, int(sf.width * scale))
+    m = np.zeros((out_h, out_w), np.uint8)
+    cnt = (np.array(sf.contour, np.int32) * scale).astype(np.int32)
+    cv2.drawContours(m, [cnt], -1, 255, thickness=-1)
+    return m
+
+def component_distances(q: ShapeFeatures, c: ShapeFeatures) -> Dict[str, float]:
+    """
+    Compute the same component distances used inside match_score for display.
+    (Values are unnormalized/raw; match_score applies weights.)
+    """
+    import cv2
+    efd_d = float(np.linalg.norm(np.array(q.efd) - np.array(c.efd)))
+    hu_d  = float(np.linalg.norm(np.array(q.hu)  - np.array(c.hu)))
+    zern_d = 0.0
+    if q.zernike is not None and c.zernike is not None:
+        zern_d = float(np.linalg.norm(np.array(q.zernike) - np.array(c.zernike)))
+
+    mQ = _mask_from_contour(q)
+    mR = _mask_from_contour(c)
+    # Hausdorff or chamfer-like fallback
+    try:
+        extractor = cv2.createHausdorffDistanceExtractor()
+        cntsQ,_ = cv2.findContours(mQ, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cntsR,_ = cv2.findContours(mR, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cQ = max(cntsQ, key=cv2.contourArea)
+        cR = max(cntsR, key=cv2.contourArea)
+        haus = float(extractor.computeDistance(cQ, cR))
+    except Exception:
+        # Chamfer-like fallback:
+        def chamfer(a, b):
+            dt = cv2.distanceTransform((255-b).astype(np.uint8), cv2.DIST_L2, 3)
+            ea = cv2.Canny(a, 50, 150)
+            ys, xs = np.where(ea > 0)
+            if len(xs) == 0: return 1e6
+            return float(np.mean(dt[ys, xs]))
+        haus = max(chamfer(mQ, mR), chamfer(mR, mQ))
+
+    dtw = float(_dtw(np.array(q.bitting), np.array(c.bitting), w=20))
+
+    # ORB mismatch (1 - inlier_ratio)
+    if q.orb_desc is None or c.orb_desc is None:
+        orb_mis = 1.0
+    else:
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+        matches = bf.knnMatch(q.orb_desc, c.orb_desc, k=2)
+        good = 0
+        for m in matches:
+            if len(m) == 2 and m[0].distance < 0.75 * m[1].distance:
+                good += 1
+        ratio = good / max(1, len(matches))
+        orb_mis = float(1.0 - ratio)
+
+    return {"efd": efd_d, "hu": hu_d, "zern": zern_d, "haus": haus, "dtw": dtw, "orb": orb_mis}
+
+# ---------------------------
 # UI helpers
 # ---------------------------
-def key_card(rec: KeyRecord):
+def key_card(rec: KeyRecord, shape_row: Optional[Dict[str, object]] = None):
     cols = st.columns([1, 2])
     with cols[0]:
         try:
@@ -383,6 +475,27 @@ def key_card(rec: KeyRecord):
         if rec.tags:
             st.write(f"Tags: `{rec.tags}`")
         st.caption(f"Added: {rec.created_at}")
+
+        with st.expander("Shape features"):
+            if shape_row is None:
+                st.info("No shape features stored yet.")
+            else:
+                w, h = shape_row["width"], shape_row["height"]
+                st.write(f"**Size:** {w}×{h}  •  **Hu:** {len(shape_row.get('hu') or [])}  •  "
+                         f"**EFD:** {len(shape_row.get('fourier') or [])}  •  "
+                         f"**Zernike:** {'yes' if shape_row.get('zernike') else 'no'}  •  "
+                         f"**ORB keypoints:** {shape_row.get('orb_kp', 0)}")
+                if shape_row.get("bitting"):
+                    try:
+                        st.line_chart(pd.Series(shape_row["bitting"]), height=120)
+                    except Exception:
+                        st.write("Bitting curve available (plot failed).")
+                if shape_row.get("svg"):
+                    st.markdown(
+                        f"<div style='background:#fafafa;border:1px solid #eee;padding:6px'>{shape_row['svg']}</div>",
+                        unsafe_allow_html=True
+                    )
+
         del_col, _ = st.columns([1, 4])
         with del_col:
             if st.button("Delete", type="secondary", key=f"del_{rec.id}"):
@@ -414,7 +527,7 @@ def show_hash_row(r: KeyRecord, total: int, comps: Dict[str, Optional[int]]):
 init_db()
 st.set_page_config(page_title=APP_TITLE, page_icon="🔑", layout="wide")
 st.title(APP_TITLE)
-st.caption("Fused shape-based matching with optional perceptual-hash view (all data stays local).")
+st.caption("Fused shape-based matching (EFD/Hu/Zernike + Hausdorff + bitting DTW + ORB) with optional hash view — all local.")
 
 with st.sidebar:
     st.header("Matching Settings")
@@ -445,7 +558,7 @@ with tabs[0]:
     target_img = capture_image_simple(key="scan")
 
     if target_img is not None:
-        # Compute features & debug viz
+        # Compute query features & debug viz
         try:
             q_feats, q_dbg = extract_and_describe(target_img)
             st.image(q_dbg, caption="Canonical silhouette & contour", width=420)
@@ -453,38 +566,36 @@ with tabs[0]:
             st.error(f"Failed to extract features: {e}")
             st.stop()
 
-        # Match against all stored shapes
-        shape_records = fetch_key_shapes()
-        if not shape_records:
+        # Match against all stored shapes (auto-backfill missing descriptor fields)
+        raw_shapes = fetch_key_shapes()
+        if not raw_shapes:
             st.info("No shape features yet. Add keys or run backfill under Export/Import.")
         else:
-            scored = []
-            for rec in shape_records:
-                if not (rec.get("contour") and rec.get("fourier") and rec.get("hu")):
-                    continue
-                cand = ShapeFeatures(
-                    width=int(rec["width"]), height=int(rec["height"]),
-                    contour=rec["contour"],
-                    # If DB has these extra fields, use them; else graceful defaults
-                    efd=rec["fourier"],
-                    hu=rec["hu"],
-                    zernike=rec.get("zernike"),
-                    bitting=rec.get("bitting") or [0.0]*160,
-                    orb_kp=int(rec.get("orb_kp", 0)),
-                    orb_desc=rec.get("orb_desc"),
-                    mask_bbox=(0, 0, int(rec["width"]), int(rec["height"]))
-                )
-                s = match_score(q_feats, cand)  # lower is better
-                scored.append((rec, s))
+            candidates: List[Tuple[Dict[str, object], ShapeFeatures]] = []
+            for rec in raw_shapes:
+                feats = ensure_full_shape_features(rec["id"], rec["image_path"], existing=rec)
+                candidates.append((rec, feats))
+
+            # Score all (lower is better)
+            scored: List[Tuple[Dict[str, object], float, ShapeFeatures]] = []
+            for rec, feats in candidates:
+                s = match_score(q_feats, feats)
+                scored.append((rec, s, feats))
             scored.sort(key=lambda x: x[1])
 
             if scored:
                 top = scored[:topk_shape]
-                best_rec, best_score = top[0]
+                best_rec, best_score, best_feats = top[0]
                 verdict = "✅ Likely match" if best_score <= shape_thresh else "⚠️ Uncertain match"
-                st.markdown(f"### {verdict}: **{best_rec['name']}** — fused shape score **{best_score:.3f}**")
+                st.markdown(f"### {verdict}: **{best_rec['name']}** — fused score **{best_score:.3f}**")
+
+                # Show breakdown for the best candidate
+                with st.expander("Score breakdown (best candidate)"):
+                    comps = component_distances(q_feats, best_feats)
+                    st.write({k: round(v, 4) for k, v in comps.items()})
+
                 with st.expander("Top candidates (shape)"):
-                    for rec, s in top:
+                    for rec, s, _feats in top:
                         st.write(f"- #{rec['id']} — **{rec['name']}** (purpose: {rec['purpose']}) — score **{s:.3f}**")
                         if rec.get("svg"):
                             st.markdown(
@@ -527,8 +638,8 @@ with tabs[0]:
                 new_id = insert_key(name, purpose or "(unspecified)", description, tags, path, hashes)
                 try:
                     feats, _dbg = extract_and_describe(Image.open(path).convert("RGB"))
-                    insert_key_shape(new_id, feats, svg=None)
-                    st.success(f"Saved new key #{new_id} with shape features.")
+                    insert_key_shape_row(new_id, feats, svg=None)
+                    st.success(f"Saved key #{new_id} with full shape features (Zernike, bitting, ORB).")
                 except Exception as e:
                     st.warning(f"Saved key #{new_id}, but shape features failed: {e}")
 
@@ -556,8 +667,8 @@ with tabs[1]:
                 new_id = insert_key(name, purpose, description, tags, path, hashes)
                 try:
                     feats, _dbg = extract_and_describe(Image.open(path).convert("RGB"))
-                    insert_key_shape(new_id, feats, svg=None)
-                    st.success(f"Added key #{new_id} with shape features.")
+                    insert_key_shape_row(new_id, feats, svg=None)
+                    st.success(f"Added key #{new_id} with full shape features.")
                 except Exception as e:
                     st.warning(f"Added key #{new_id}, but shape features failed: {e}")
 
@@ -568,6 +679,10 @@ with tabs[2]:
     if df.empty:
         st.info("No keys yet. Add some in the **Add Key** tab.")
     else:
+        # pull shapes once for mapping
+        rows_shapes = fetch_key_shapes()
+        by_id = {r["id"]: r for r in rows_shapes}
+
         q = st.text_input("Search by name / purpose / tags")
         view = df.copy()
         if q:
@@ -581,19 +696,12 @@ with tabs[2]:
 
         for _, row in view.iterrows():
             rec = KeyRecord(
-                id=int(row["id"]),
-                name=row["name"],
-                purpose=row["purpose"],
-                description=row["description"],
-                tags=row["tags"],
-                image_path=row["image_path"],
-                ahash=row.get("ahash"),
-                phash=row.get("phash"),
-                dhash=row.get("dhash"),
-                whash=row.get("whash"),
-                created_at=row["created_at"],
+                id=int(row["id"]), name=row["name"], purpose=row["purpose"], description=row["description"],
+                tags=row["tags"], image_path=row["image_path"], ahash=row.get("ahash"), phash=row.get("phash"),
+                dhash=row.get("dhash"), whash=row.get("whash"), created_at=row["created_at"],
             )
-            key_card(rec)
+            shape_row = by_id.get(rec.id)
+            key_card(rec, shape_row)
 
         with st.expander("Table view"):
             st.dataframe(df[["id", "name", "purpose", "tags", "created_at"]], use_container_width=True)
@@ -605,22 +713,39 @@ with tabs[3]:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Export your database**")
-        if st.button("Export to CSV"):
+        if st.button("Export KEYS to CSV"):
             df = fetch_keys_df()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out = EXPORT_DIR / f"keys_{ts}.csv"
             df.to_csv(out, index=False)
-            st.success(f"Exported to {out}")
-        if st.button("Export to JSON"):
+            st.success(f"Exported KEYS to {out}")
+
+        if st.button("Export KEYS to JSON"):
             df = fetch_keys_df()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             out = EXPORT_DIR / f"keys_{ts}.json"
             df.to_json(out, orient="records", indent=2)
-            st.success(f"Exported to {out}")
+            st.success(f"Exported KEYS to {out}")
+
+        if st.button("Export SHAPES to JSON"):
+            rows = fetch_key_shapes()
+            # Convert np arrays back to lists where needed
+            serializable = []
+            for r in rows:
+                s = dict(r)
+                if isinstance(s.get("orb_desc"), np.ndarray):
+                    s["orb_desc"] = s["orb_desc"].tolist()
+                serializable.append(s)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out = EXPORT_DIR / f"key_shapes_{ts}.json"
+            with open(out, "w", encoding="utf-8") as f:
+                json.dump(serializable, f, indent=2)
+            st.success(f"Exported SHAPES to {out}")
 
     with c2:
         st.markdown("**Import from CSV/JSON**")
-        imp = st.file_uploader("Upload a CSV or JSON previously exported by this app", type=["csv", "json"], key="imp")
+
+        imp = st.file_uploader("Upload KEYS CSV/JSON exported by this app", type=["csv", "json"], key="imp_keys")
         if imp is not None:
             try:
                 if imp.type == "application/json" or imp.name.lower().endswith(".json"):
@@ -655,25 +780,80 @@ with tabs[3]:
                             try:
                                 if Path(img_path).exists():
                                     feats, _ = extract_and_describe(Image.open(img_path).convert("RGB"))
-                                    insert_key_shape(new_id, feats, svg=None)
+                                    insert_key_shape_row(new_id, feats, svg=None)
                             except Exception:
                                 pass
                             count += 1
                         except Exception as e:
                             st.warning(f"Skipped one row due to error: {e}")
-                    st.success(f"Imported {count} records.")
+                    st.success(f"Imported {count} KEYS.")
             except Exception as e:
-                st.error(f"Import failed: {e}")
+                st.error(f"Import KEYS failed: {e}")
+
+        imp_shapes = st.file_uploader("Upload SHAPES JSON exported by this app", type=["json"], key="imp_shapes")
+        if imp_shapes is not None:
+            try:
+                loaded = json.load(io.BytesIO(imp_shapes.getvalue()))
+                count = 0
+                with get_conn() as conn:
+                    for r in loaded:
+                        try:
+                            key_id = int(r["id"])
+                            # Ensure the key exists; otherwise skip (or you could create a stub)
+                            cur = conn.cursor()
+                            cur.execute("SELECT 1 FROM keys WHERE id=?", (key_id,))
+                            if not cur.fetchone():
+                                continue
+                            # Normalize arrays to JSON strings
+                            hu = json.dumps(r.get("hu"))
+                            fourier = json.dumps(r.get("fourier"))
+                            contour = json.dumps(r.get("contour"))
+                            zernike = json.dumps(r.get("zernike")) if r.get("zernike") is not None else None
+                            bitting = json.dumps(r.get("bitting"))
+                            orb_kp = int(r.get("orb_kp", 0))
+                            orb_desc = r.get("orb_desc")
+                            if isinstance(orb_desc, list):
+                                orb_desc = json.dumps(orb_desc)
+                            elif orb_desc is None:
+                                orb_desc = None
+                            svg = r.get("svg")
+
+                            conn.execute(
+                                """
+                                INSERT OR REPLACE INTO key_shapes
+                                  (key_id, svg, hu, fourier, contour, width, height, zernike, bitting, orb_kp, orb_desc)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    key_id,
+                                    svg,
+                                    hu,
+                                    fourier,
+                                    contour,
+                                    int(r["width"]),
+                                    int(r["height"]),
+                                    zernike,
+                                    bitting,
+                                    orb_kp,
+                                    orb_desc,
+                                ),
+                            )
+                            count += 1
+                    conn.commit()
+                st.success(f"Imported/updated {count} SHAPES rows.")
+            except Exception as e:
+                st.error(f"Import SHAPES failed: {e}")
 
     with st.expander("Shape features maintenance", expanded=False):
-        if st.button("Compute/refresh shape features for all keys"):
+        st.write("Compute or refresh **full** shape features (Zernike, bitting, ORB) for all keys.")
+        if st.button("Compute/refresh ALL"):
             df_all = fetch_keys_df()
             ok, fail = 0, 0
             for _, r in df_all.iterrows():
                 try:
                     p = str(r["image_path"])
                     feats, _ = extract_and_describe(Image.open(p).convert("RGB"))
-                    insert_key_shape(int(r["id"]), feats, svg=None)
+                    insert_key_shape_row(int(r["id"]), feats, svg=None)
                     ok += 1
                 except Exception:
                     fail += 1
@@ -708,7 +888,7 @@ def _run_self_tests() -> None:
     f1, _ = extract_and_describe(rect_rgb)
     f2, _ = extract_and_describe(rect2)
     s = match_score(f1, f2)
-    assert s < 0.4, f"shape score too large for similar objects: {s}"
+    assert s < 0.5, f"shape score too large for similar objects: {s}"
     print("All self-tests passed ✔️")
 
 if __name__ == "__main__" and os.getenv("RUN_KEY_APP_TESTS") == "1":

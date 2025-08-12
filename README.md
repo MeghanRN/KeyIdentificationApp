@@ -1,9 +1,6 @@
 # Key Identification App — Fused Outline Matcher
 
 A dead-simple, reliable way to identify **your own keys** by comparing the **outline** of a new photo with keys you’ve saved before. No heavy ML. No cloud. Just OpenCV + NumPy + Streamlit — local and fast.
-
-This build replaces the earlier, complex pipeline with a **lean fused-outline algorithm** that’s robust to rotation, small scale changes, and lighting differences.
-
 ---
 
 ## Features
@@ -42,7 +39,7 @@ streamlit run app.py
 
 ---
 
-## How It Works (short version)
+## How It Works
 
 1. **Segment** the key with Otsu thresholding and morphology; keep the **largest** contour.
 2. **Resample** the contour to a fixed length (default `256` points).

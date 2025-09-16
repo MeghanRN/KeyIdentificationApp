@@ -1,7 +1,5 @@
-# Key Identification App — Fused Outline Matcher
-
-A dead-simple, reliable way to identify **your own keys** by comparing the **outline** of a new photo with keys you’ve saved before. No heavy ML. No cloud. Just OpenCV + NumPy + Streamlit — local and fast.
----
+# Key Identification App 
+A dead-simple, reliable way to identify **your own keys** by comparing the **outline** of a new photo with keys you’ve saved before. No heavy ML. No cloud. Just OpenCV + NumPy + Streamlit.
 
 ## Features
 
